@@ -1,9 +1,43 @@
 AWSTemplateFormatVersion: "2010-09-09"
 Description: >
   Infraestrutura automatizada com VPC, EC2 e RDS.
+  - Parametriza AMI via SSM, KeyName, tipos de instância e credenciais do RDS (NoEcho).
+  - Separa Security Groups (Web e DB) e restringe SSH por parâmetro.
+  - Usa duas AZs com subnets públicas e privadas e DBSubnetGroup com ambas as subnets.
+  - Output do DNS público da instância EC2 e adiciona endpoint do RDS.
+
+Parameters:
+  KeyName:
+    Type: AWS::EC2::KeyPair::KeyName
+    Description: Nome do par de chaves EC2 já existente na região.
+  LatestAmiSSM:
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Default: /aws/service/ami-amazon-linux-latest/amzn2-ami-hvm-x86_64-gp2
+    Description: SSM parameter que aponta para a AMI Amazon Linux 2 mais recente.
+  InstanceType:
+    Type: String
+    Default: t3.micro
+    Description: Tipo da instância EC2
+  AllowedSSHLocation:
+    Type: String
+    Default: 0.0.0.0/0
+    Description: CIDR que terá acesso SSH (recomenda-se alterar para seu IP/32).
+  DBUsername:
+    Type: String
+    Default: admin
+    Description: Usuário master do banco de dados RDS.
+  DBPassword:
+    Type: String
+    NoEcho: true
+    MinLength: 8
+    Description: Senha do usuário master do RDS. (Sem valor padrão — passe um valor seguro ao criar o stack)
+  DBInstanceClass:
+    Type: String
+    Default: db.t3.micro
+    Description: Classe da instância RDS
 
 Resources:
-  # --- VPC ---
+  # VPC
   MyVPC:
     Type: AWS::EC2::VPC
     Properties:
@@ -11,11 +45,11 @@ Resources:
       EnableDnsSupport: true
       EnableDnsHostnames: true
       Tags:
-        - Key: Example
-          Value: MyVPC
+        - Key: Name
+          Value: ExemploVPC
 
-  # --- Subnets ---
-  PublicSubnet:
+  # Subnets públicas (duas AZs)
+  PublicSubnetA:
     Type: AWS::EC2::Subnet
     Properties:
       VpcId: !Ref MyVPC
@@ -23,26 +57,48 @@ Resources:
       MapPublicIpOnLaunch: true
       AvailabilityZone: !Select [0, !GetAZs '']
       Tags:
-        - Key: Example
-          Value: PublicSubnet
+        - Key: Name
+          Value: PublicSubnetA
 
-  PrivateSubnet:
+  PublicSubnetB:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref MyVPC
+      CidrBlock: 10.0.3.0/24
+      MapPublicIpOnLaunch: true
+      AvailabilityZone: !Select [1, !GetAZs '']
+      Tags:
+        - Key: Name
+          Value: PublicSubnetB
+
+  # Subnets privadas (duas AZs) para RDS
+  PrivateSubnetA:
     Type: AWS::EC2::Subnet
     Properties:
       VpcId: !Ref MyVPC
       CidrBlock: 10.0.2.0/24
       AvailabilityZone: !Select [0, !GetAZs '']
       Tags:
-        - Key: Example
-          Value: PrivateSubnet
+        - Key: Name
+          Value: PrivateSubnetA
 
-  # --- Internet Gateway ---
+  PrivateSubnetB:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref MyVPC
+      CidrBlock: 10.0.4.0/24
+      AvailabilityZone: !Select [1, !GetAZs '']
+      Tags:
+        - Key: Name
+          Value: PrivateSubnetB
+
+  # Internet Gateway e rota pública
   InternetGateway:
     Type: AWS::EC2::InternetGateway
     Properties:
       Tags:
-        - Key: Example
-          Value: MyInternetGateway
+        - Key: Name
+          Value: ExemploIGW
 
   AttachGateway:
     Type: AWS::EC2::VPCGatewayAttachment
@@ -50,11 +106,13 @@ Resources:
       VpcId: !Ref MyVPC
       InternetGatewayId: !Ref InternetGateway
 
-  # --- Route Table ---
   PublicRouteTable:
     Type: AWS::EC2::RouteTable
     Properties:
       VpcId: !Ref MyVPC
+      Tags:
+        - Key: Name
+          Value: PublicRouteTable
 
   PublicRoute:
     Type: AWS::EC2::Route
@@ -63,72 +121,87 @@ Resources:
       DestinationCidrBlock: 0.0.0.0/0
       GatewayId: !Ref InternetGateway
 
-  PublicSubnetRouteTableAssociation:
+  PublicSubnetARouteTableAssociation:
     Type: AWS::EC2::SubnetRouteTableAssociation
     Properties:
-      SubnetId: !Ref PublicSubnet
+      SubnetId: !Ref PublicSubnetA
       RouteTableId: !Ref PublicRouteTable
 
-  # --- Security Group ---
+  PublicSubnetBRouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnetB
+      RouteTableId: !Ref PublicRouteTable
+
+  # Security Groups
   WebServerSG:
     Type: AWS::EC2::SecurityGroup
     Properties:
-      GroupDescription: Permite acesso HTTP e SSH
+      GroupDescription: Security Group para camada web (HTTP e SSH restrito)
       VpcId: !Ref MyVPC
       SecurityGroupIngress:
-        - IpProtocol: tcp
-          FromPort: 22
-          ToPort: 22
-          CidrIp: 0.0.0.0/0
         - IpProtocol: tcp
           FromPort: 80
           ToPort: 80
           CidrIp: 0.0.0.0/0
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: !Ref AllowedSSHLocation
       Tags:
-        - Key: Example
+        - Key: Name
           Value: WebServerSG
 
-  # --- Instância EC2 ---
+  DBSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Security Group para RDS (apenas acesso por 3306 vindo do WebServerSG)
+      VpcId: !Ref MyVPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 3306
+          ToPort: 3306
+          SourceSecurityGroupId: !Ref WebServerSG
+      Tags:
+        - Key: Name
+          Value: DBSG
+
+  # Instância EC2 (web)
   WebServerInstance:
     Type: AWS::EC2::Instance
     Properties:
-      InstanceType: t3.micro
-      ImageId: ami-0c55b159cbfafe1f0 # Amazon Linux 2 (região us-east-1)
-      SubnetId: !Ref PublicSubnet
+      InstanceType: !Ref InstanceType
+      ImageId: !Ref LatestAmiSSM
+      SubnetId: !Ref PublicSubnetA
       SecurityGroupIds:
         - !Ref WebServerSG
-      KeyName: my-keypair
+      KeyName: !Ref KeyName
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash
+          yum update -y
+          yum install -y httpd
+          systemctl enable httpd
+          systemctl start httpd
+          echo "<h1>Server provisioned by CloudFormation</h1>" > /var/www/html/index.html
       Tags:
-        - Key: Example
-          Value: WebServer
+        - Key: Name
+          Value: WebServerInstance
 
-  # --- Banco de Dados RDS ---
+  # DB Subnet Group (para RDS)
+  DBSubnetGroup:
+    Type: AWS::RDS::DBSubnetGroup
+    Properties:
+      DBSubnetGroupDescription: "Subnets privadas para RDS"
+      SubnetIds:
+        - !Ref PrivateSubnetA
+        - !Ref PrivateSubnetB
+      Tags:
+        - Key: Name
+          Value: DBSubnetGroup
+
+  # Instância RDS MySQL
   MyDB:
     Type: AWS::RDS::DBInstance
     Properties:
       Engine: mysql
-      DBInstanceClass: db.t3.micro
-      AllocatedStorage: 20
-      MasterUsername: admin
-      MasterUserPassword: 27MySecurePass!
-      DBSubnetGroupName: !Ref DBSubnetGroup
-      VPCSecurityGroups:
-        - !Ref WebServerSG
-      PubliclyAccessible: false
-      BackupRetentionPeriod: 3
-      MultiAZ: false
-
-  DBSubnetGroup:
-    Type: AWS::RDS::DBSubnetGroup
-    Properties:
-      DBSubnetGroupDescription: Subnets privadas para o RDS
-      SubnetIds:
-        - !Ref PrivateSubnet
-      Tags:
-        - Key: Example
-          Value: DBSubnetGroup
-
-Outputs:
-  WebsiteURL:
-    Description: URL pública do servidor web
-    Value: !Join ['', ['http://', !GetAtt WebServerInstance.PublicDnsExemple]]
